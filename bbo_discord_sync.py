@@ -15,12 +15,13 @@ import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as midnight
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 
 MYHANDS_URL = "https://www.bridgebase.com/myhands/index.php?&from_login=1"
+MYHANDS_RESULTS_URL = "https://www.bridgebase.com/myhands/hands.php"
 DEFAULT_TARGET = "wei1011"
 DEFAULT_ZONE = "Asia/Taipei"
 
@@ -310,22 +311,30 @@ def read_state(path: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {"last_stable_time": 0, "sent_urls": [], "threads": {}}
 
 
-def main() -> int:
-    cfg = parse_args()
-    now = int(time.time())
-    state = read_state(cfg.state)
-    start = state.get("last_stable_time") or now - cfg.days * 86400
-    print(f"查詢起點 Unix timestamp: {start}；回溯 {cfg.days} 天（若 state 為空）")
-    username, password = os.getenv("BBO_USERNAME"), os.getenv("BBO_PASSWORD")
-    token, channel_id = os.getenv("DISCORD_BOT_TOKEN"), os.getenv("DISCORD_CHANNEL_ID")
-    if not cfg.manual_login and (not username or not password):
-        raise SystemExit("缺少 BBO_USERNAME 或 BBO_PASSWORD")
-    if not cfg.dry_run and (not token or not channel_id):
-        raise SystemExit("建立討論串需要 DISCORD_BOT_TOKEN 與 DISCORD_CHANNEL_ID")
-    screenshot_dir = Path("screenshots")
-    screenshot_dir.mkdir(exist_ok=True)
+def date_range_timestamps(start_date: str, end_date: str, zone: str) -> tuple[int, int]:
+    """Return an inclusive local-date range as [start, end) Unix timestamps."""
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        tz = ZoneInfo(zone)
+    except (ValueError, KeyError) as exc:
+        raise ValueError("日期必須是 YYYY-MM-DD，且時區必須有效") from exc
+    start_ts = int(datetime.combine(start, midnight.min, tzinfo=tz).timestamp())
+    end_ts = int(datetime.combine(end, midnight.min, tzinfo=tz).timestamp()) + 86400
+    if end_ts <= start_ts:
+        raise ValueError("結束日期必須不早於開始日期")
+    return start_ts, end_ts
+
+
+def query_url(target: str, start_ts: int, end_ts: int) -> str:
+    return MYHANDS_RESULTS_URL + "?" + urlencode({"username": target, "start_time": start_ts, "end_time": end_ts})
+
+
+def scrape_range(cfg, start_ts: int, end_ts: int, screenshot_dir: Path) -> list[Hand]:
+    """Login to BBO, query one date range, and collect its screenshots."""
     from playwright.sync_api import sync_playwright
 
+    username, password = os.getenv("BBO_USERNAME"), os.getenv("BBO_PASSWORD")
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not cfg.manual_login)
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, locale="zh-TW")
@@ -340,34 +349,28 @@ def main() -> int:
                     page.locator('input[type="password"]').first.fill(password)
                     page.locator('button[type="submit"], input[type="submit"]').first.click()
                     page.wait_for_timeout(2_000)
-            form = page.locator("#myhands")
-            if not form.count():
-                page.goto(MYHANDS_URL, wait_until="domcontentloaded", timeout=60_000)
-                form = page.locator("#myhands")
-            today = datetime.now(ZoneInfo(cfg.timezone)).date()
-            form.locator('input[name="username"]').fill(cfg.target_user)
-            form.locator('select[name="start_time[Y]"]').select_option(str(today.year))
-            form.locator('select[name="start_time[M]"]').select_option(str(today.month))
-            form.locator('select[name="start_time[d]"]').select_option(str(today.day))
-            form.locator('select[name="time_interval[0]"]').select_option("1")
-            form.locator('select[name="time_interval[1]"]').select_option("3")
-            form.locator('input[name="time_arrow"][value="-"]').check()
-            form.locator('select[name="summaries[0]"]').select_option("3")
-            form.locator('input[type="submit"]').first.click()
-            page.wait_for_load_state("domcontentloaded")
-            hands = [h for h in collect_hands(page, cfg.target_user, cfg.timezone, screenshot_dir) if h.timestamp >= start]
+            page.goto(query_url(cfg.target_user, start_ts, end_ts), wait_until="domcontentloaded", timeout=60_000)
+            return collect_hands(page, cfg.target_user, cfg.timezone, screenshot_dir)
         finally:
             context.close()
             browser.close()
 
+
+def sync_range(cfg, start_ts: int, end_ts: int, now: int | None = None) -> tuple[int, int]:
+    """Search, group, and publish a range. Returns (found, sent)."""
+    now = now or int(time.time())
+    state = read_state(cfg.state)
+    screenshot_dir = Path("screenshots")
+    screenshot_dir.mkdir(exist_ok=True)
+    hands = [h for h in scrape_range(cfg, start_ts, end_ts, screenshot_dir) if start_ts <= h.timestamp < end_ts]
     stable, pending = stable_groups(hands, now, cfg.group_minutes * 60)
     stable = [organize_batch(ordered_batch(batch), screenshot_dir, cfg.timezone) for batch in stable]
     if pending:
         pending = organize_batch(ordered_batch(pending), screenshot_dir, cfg.timezone)
-    print(f"查到 {len(hands)} 筆；穩定 {sum(map(len, stable))} 筆；待下次 {len(pending)} 筆")
     sent = set(state.get("sent_urls", []))
     group_channels = state.setdefault("group_channels", {})
-    hand_threads = state.setdefault("hand_threads", {})
+    hand_threads = state.setdefault("hand_threads", state.get("threads", {}))
+    sent_count = 0
     for batch in stable:
         new = [h for h in batch if h.url not in sent]
         if not new:
@@ -375,22 +378,41 @@ def main() -> int:
         key = str(min(hand.timestamp for hand in batch))
         if not cfg.dry_run:
             group_time = datetime.fromtimestamp(int(key), ZoneInfo(cfg.timezone)).strftime("%Y-%m-%d-%H%M")
-            group_channel = group_channels.get(key) or create_group_channel(channel_id, token, group_time)
+            group_channel = group_channels.get(key) or create_group_channel(cfg.channel_id, cfg.token, group_time)
             group_channels[key] = group_channel
             for hand in new:
-                thread_id = hand_threads.get(hand.url) or create_hand_thread(group_channel, token, hand, cfg.timezone)
+                thread_id = hand_threads.get(hand.url) or create_hand_thread(group_channel, cfg.token, hand, cfg.timezone)
                 hand_threads[hand.url] = thread_id
-                send_hand(thread_id, token, hand, cfg.timezone)
+                send_hand(thread_id, cfg.token, hand, cfg.timezone)
                 sent.add(hand.url)
-                state["sent_urls"] = list(sent)[-5000:]
-                cfg.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+                sent_count += 1
         else:
             sent.update(h.url for h in new)
+            sent_count += len(new)
     if not cfg.dry_run:
         state["sent_urls"] = list(sent)[-5000:]
         if stable and not pending:
             state["last_stable_time"] = max(h.timestamp for batch in stable for h in batch)
         cfg.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    return len(hands), sent_count
+
+
+def main() -> int:
+    cfg = parse_args()
+    now = int(time.time())
+    state = read_state(cfg.state)
+    start = state.get("last_stable_time") or now - cfg.days * 86400
+    print(f"查詢起點 Unix timestamp: {start}；回溯 {cfg.days} 天（若 state 為空）")
+    username, password = os.getenv("BBO_USERNAME"), os.getenv("BBO_PASSWORD")
+    token, channel_id = os.getenv("DISCORD_BOT_TOKEN"), os.getenv("DISCORD_CHANNEL_ID")
+    if not cfg.manual_login and (not username or not password):
+        raise SystemExit("缺少 BBO_USERNAME 或 BBO_PASSWORD")
+    if not cfg.dry_run and (not token or not channel_id):
+        raise SystemExit("建立討論串需要 DISCORD_BOT_TOKEN 與 DISCORD_CHANNEL_ID")
+    cfg.token, cfg.channel_id = token, channel_id
+    end = now + 86400
+    found, sent_count = sync_range(cfg, start, end, now)
+    print(f"查到 {found} 筆；本次送出 {sent_count} 筆")
     return 0
 
 

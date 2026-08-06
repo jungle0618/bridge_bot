@@ -41,4 +41,21 @@ python bbo_discord_sync.py --dry-run
 python bbo_discord_sync.py --manual-login --dry-run
 ```
 
+## Discord 內手動搜尋
+
+若要在 Discord 內輸入指令，需另外長時間執行常駐 Bot（不適合放在每天執行一次的 GitHub Actions）：
+
+```bash
+python bbo_discord_bot.py
+```
+
+常駐 Bot 使用同一組 `BBO_USERNAME`、`BBO_PASSWORD`、`DISCORD_BOT_TOKEN`，並可選設定 `BBO_TARGET_USER`、`BBO_TIMEZONE`、`BBO_STATE`。
+
+Slash Command 用法：
+
+- `/bbo_search start:2026-07-01 end:2026-07-20`：搜尋 7 月 1 日至 7 月 20 日（首尾皆包含）。
+- `/bbo_search`：從 `state.json` 的 `last_stable_time` 搜尋到現在；沒有紀錄時回溯 20 天。
+
+日期區間搜尋仍會沿用原本的分組、截圖、Discord 頻道／Thread 建立和 URL 去重邏輯。Bot 必須邀請 `applications.commands` scope，且執行帳號有使用該 Slash Command 的權限。
+
 GitHub Actions 使用 `workflow_dispatch` 可手動觸發，也會每天 00:00 UTC 自動執行。`state.json` 會由 Actions commit 回 Repository，保存上次已處理時間與已送出的網址。
