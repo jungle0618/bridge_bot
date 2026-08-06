@@ -137,6 +137,8 @@ def collect_hands(page, target: str, zone: str, screenshot_dir: Path) -> list[Ha
         except PlaywrightTimeoutError:
             print(f"traveller timeout: {traveller}", file=sys.stderr)
 
+    print(f"BBO traveller {len(travellers)} 筆；候選 handviewer {len(candidates)} 筆")
+
     result: list[Hand] = []
     seen: set[str] = set()
     for index, (candidate, text) in enumerate(candidates.items(), 1):
@@ -159,6 +161,7 @@ def collect_hands(page, target: str, zone: str, screenshot_dir: Path) -> list[Ha
         screenshot = screenshot_dir / filename
         page.screenshot(path=str(screenshot), full_page=True)
         result.append(Hand(timestamp, lin_url, board_label(lin_url, index), str(screenshot)))
+    print(f"展開 LIN 成功 {len(seen)} 筆；包含 {target} 的牌局 {len(result)} 筆")
     return sorted(result, key=lambda h: (h.timestamp, h.url))
 
 
@@ -224,6 +227,7 @@ def main() -> int:
     now = int(time.time())
     state = read_state(cfg.state)
     start = state.get("last_stable_time") or now - cfg.days * 86400
+    print(f"查詢起點 Unix timestamp: {start}；回溯 {cfg.days} 天（若 state 為空）")
     username, password = os.getenv("BBO_USERNAME"), os.getenv("BBO_PASSWORD")
     token, channel_id = os.getenv("DISCORD_BOT_TOKEN"), os.getenv("DISCORD_CHANNEL_ID")
     if not cfg.manual_login and (not username or not password):
