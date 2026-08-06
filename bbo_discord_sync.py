@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-user", default=os.getenv("BBO_TARGET_USER", DEFAULT_TARGET))
     p.add_argument("--state", type=Path, default=Path("state.json"))
     p.add_argument("--timezone", default=os.getenv("BBO_TIMEZONE", DEFAULT_TIMEZONE))
-    p.add_argument("--lookback-hours", type=float, default=24)
+    p.add_argument("--lookback-hours", type=float, default=31 * 24, help="首次執行查詢的回溯時間，預設 31 天")
     p.add_argument("--group-minutes", type=int, default=30)
     p.add_argument("--manual-login", action="store_true", help="Use visible browser and login manually")
     p.add_argument("--dry-run", action="store_true", help="Do not send Discord messages or write state")
@@ -69,7 +69,7 @@ def canonical_hand_url(url: str) -> str | None:
     return url
 
 
-def timestamp_from_text(text: str) -> int | None:
+def timestamp_from_text(text: str, timezone: str = DEFAULT_TIMEZONE) -> int | None:
     patterns = [
         r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})[ T]+(\d{1,2}):(\d{2})",
         r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})[ T]+(\d{1,2}):(\d{2})",
@@ -90,7 +90,7 @@ def timestamp_from_text(text: str) -> int | None:
         else:
             day, month_name, year, hour, minute = values
             month, year, day, hour, minute = months[month_name[:3].lower()], int(year), int(day), int(hour), int(minute)
-        return int(datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)).timestamp())
+        return int(datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(timezone)).timestamp())
     return None
 
 
@@ -100,16 +100,15 @@ def timestamp_from_url(url: str) -> int | None:
     return min(candidates) if candidates else None
 
 
-def extract_timestamp(url: str, row_text: str) -> int | None:
-    return timestamp_from_url(url) or timestamp_from_text(row_text)
+def extract_timestamp(url: str, row_text: str, timezone: str = DEFAULT_TIMEZONE) -> int | None:
+    return timestamp_from_url(url) or timestamp_from_text(row_text, timezone)
 
 
-def fetch_hands(page, target_url: str) -> list[Hand]:
+def viewer_links_on_page(page) -> list[tuple[str, str]]:
+    """Return (viewer_url, nearby_text) links from the current BBO page."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-    page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(1_000)
-    found: dict[str, Hand] = {}
+    links: list[tuple[str, str]] = []
     for anchor in page.locator("a").all():
         href = anchor.get_attribute("href") or ""
         if "handviewer.html" not in href and "lin=" not in href and "myhand=" not in href:
@@ -121,9 +120,47 @@ def fetch_hands(page, target_url: str) -> list[Hand]:
             row_text = anchor.locator("xpath=ancestor::tr[1]").inner_text(timeout=2_000)
         except PlaywrightTimeoutError:
             row_text = anchor.inner_text()
-        timestamp = extract_timestamp(url, row_text)
+        links.append((url, " ".join(row_text.split())))
+    return links
+
+
+def fetch_hands(page, timezone: str = DEFAULT_TIMEZONE) -> list[Hand]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    page.wait_for_timeout(1_000)
+    found: dict[str, Hand] = {}
+    traveller_links: list[tuple[str, str]] = []
+    for anchor in page.locator("a").all():
+        href = anchor.get_attribute("href") or ""
+        if "traveller=" not in href:
+            continue
+        try:
+            row_text = anchor.locator("xpath=ancestor::tr[1]").inner_text(timeout=2_000)
+        except PlaywrightTimeoutError:
+            row_text = anchor.inner_text()
+        traveller_links.append((urljoin(page.url, href), " ".join(row_text.split())))
+
+    for url, row_text in viewer_links_on_page(page):
+        timestamp = extract_timestamp(url, row_text, timezone)
         if timestamp is not None:
-            found[url] = Hand(timestamp=timestamp, url=url, label=" ".join(row_text.split()))
+            found[url] = Hand(timestamp=timestamp, url=url, label=row_text)
+
+    # My Hands search results normally expose traveller URLs first. Each
+    # traveller page contains the Movie link that expands to a handviewer URL.
+    seen_travellers: set[str] = set()
+    for traveller_url, result_text in traveller_links:
+        if traveller_url in seen_travellers:
+            continue
+        seen_travellers.add(traveller_url)
+        try:
+            page.goto(traveller_url, wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(300)
+            for viewer_url, movie_text in viewer_links_on_page(page):
+                timestamp = extract_timestamp(viewer_url, movie_text, timezone) or timestamp_from_url(traveller_url)
+                if timestamp is not None:
+                    found[viewer_url] = Hand(timestamp=timestamp, url=viewer_url, label=movie_text or result_text)
+        except PlaywrightTimeoutError:
+            print(f"跳過逾時 traveller：{traveller_url}", file=sys.stderr)
     return sorted(found.values(), key=lambda item: (item.timestamp, item.url))
 
 
@@ -164,9 +201,9 @@ def send_discord(webhook: str, hands: list[Hand], timezone: str) -> None:
         time.sleep(1.0)
 
 
-def open_query_and_login(page, target_url: str, username: str | None, password: str | None, manual: bool) -> None:
-    page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-    if "/myhands/index.php" not in page.url:
+def login_and_open_myhands(page, username: str | None, password: str | None, manual: bool) -> None:
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+    if page.locator('input[type="password"]').count() == 0:
         return
     if manual:
         input("請在瀏覽器手動登入 BBO，完成後按 Enter：")
@@ -178,9 +215,31 @@ def open_query_and_login(page, target_url: str, username: str | None, password: 
     page.locator('button[type="submit"], input[type="submit"]').first.click()
     for _ in range(30):
         page.wait_for_timeout(1_000)
-        if "/myhands/index.php" not in page.url or "Logged in as" in page.content():
+        if page.locator('input[type="password"]').count() == 0:
             return
-    raise RuntimeError("BBO 登入未完成，仍停留在 index.php?from_login=1。")
+    raise RuntimeError("BBO 登入未完成，仍停留在登入頁。")
+
+
+def search_by_bbo_form(page, target: str, timezone: str) -> None:
+    """Use the same date/interval form as BBO's My Hands page."""
+    today = datetime.now(ZoneInfo(timezone)).date()
+    form = page.locator("#myhands")
+    if form.count() == 0:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+        form = page.locator("#myhands")
+    if form.count() == 0:
+        raise RuntimeError("登入後找不到 BBO My Hands 日期表單。")
+    form.locator('input[name="username"]').fill(target)
+    form.locator('select[name="start_time[Y]"]').select_option(str(today.year))
+    form.locator('select[name="start_time[M]"]').select_option(str(today.month))
+    form.locator('select[name="start_time[d]"]').select_option(str(today.day))
+    form.locator('select[name="time_interval[0]"]').select_option("2")  # month(s)
+    form.locator('select[name="time_interval[1]"]').select_option("1")
+    form.locator('input[name="time_arrow"][value="-"]').check()
+    form.locator('select[name="summaries[0]"]').select_option("3")
+    form.locator('input[type="submit"]').first.click()
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(1_000)
 
 
 def main() -> int:
@@ -196,7 +255,6 @@ def main() -> int:
     if not webhook and not cfg.dry_run:
         raise SystemExit("請設定 DISCORD_WEBHOOK_URL")
 
-    target_url = make_query(cfg.target_user, start, now)
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
@@ -204,8 +262,9 @@ def main() -> int:
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, locale="zh-TW")
         page = context.new_page()
         try:
-            open_query_and_login(page, target_url, username, password, cfg.manual_login)
-            hands = fetch_hands(page, target_url)
+            login_and_open_myhands(page, username, password, cfg.manual_login)
+            search_by_bbo_form(page, cfg.target_user, cfg.timezone)
+            hands = fetch_hands(page, cfg.timezone)
         finally:
             context.close()
             browser.close()
