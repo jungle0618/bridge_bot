@@ -2,15 +2,13 @@
 
 這個專案每天執行一次，查詢 `wei1011` 的 BBO 牌局，並把已經穩定的牌局網址送到 Discord。
 
-## GitHub Secrets
+## GitHub Secret
 
-在 Repository → Settings → Secrets and variables → Actions 新增：
+只需要在 Repository → Settings → Secrets and variables → Actions 新增：
 
-- `BBO_USERNAME`：BBO 登入帳號
-- `BBO_PASSWORD`：BBO 登入密碼
 - `DISCORD_WEBHOOK_URL`：Discord 頻道 Webhook URL
 
-不要把這些值寫進程式碼或 `state.json`。
+BBO 帳號與密碼目前依專案設定直接寫在 `.github/workflows/bbo-discord-sync.yml`。Discord Webhook 仍必須保持 Secret。
 
 ## 時間分組規則
 

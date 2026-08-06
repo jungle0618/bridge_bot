@@ -164,6 +164,25 @@ def send_discord(webhook: str, hands: list[Hand], timezone: str) -> None:
         time.sleep(1.0)
 
 
+def open_query_and_login(page, target_url: str, username: str | None, password: str | None, manual: bool) -> None:
+    page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+    if "/myhands/index.php" not in page.url:
+        return
+    if manual:
+        input("請在瀏覽器手動登入 BBO，完成後按 Enter：")
+        return
+    user = page.locator('input[name="username"], input[name="user"], input[type="text"]').first
+    secret = page.locator('input[type="password"]').first
+    user.fill(username or "")
+    secret.fill(password or "")
+    page.locator('button[type="submit"], input[type="submit"]').first.click()
+    for _ in range(30):
+        page.wait_for_timeout(1_000)
+        if "/myhands/index.php" not in page.url or "Logged in as" in page.content():
+            return
+    raise RuntimeError("BBO 登入未完成，仍停留在 index.php?from_login=1。")
+
+
 def main() -> int:
     cfg = parse_args()
     state = read_state(cfg.state)
@@ -185,17 +204,7 @@ def main() -> int:
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, locale="zh-TW")
         page = context.new_page()
         try:
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-            if "/myhands/index.php" in page.url:
-                if cfg.manual_login:
-                    input("請在瀏覽器手動登入 BBO，完成後按 Enter：")
-                else:
-                    user = page.locator('input[name="username"], input[name="user"], input[type="text"]').first
-                    secret = page.locator('input[type="password"]').first
-                    user.fill(username)
-                    secret.fill(password)
-                    page.locator('button[type="submit"], input[type="submit"]').first.click()
-                    page.wait_for_load_state("domcontentloaded")
+            open_query_and_login(page, target_url, username, password, cfg.manual_login)
             hands = fetch_hands(page, target_url)
         finally:
             context.close()
