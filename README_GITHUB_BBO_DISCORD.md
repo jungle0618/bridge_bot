@@ -1,0 +1,35 @@
+# BBO → Discord GitHub Repository
+
+這個專案每天執行一次，查詢 `wei1011` 的 BBO 牌局，並把已經穩定的牌局網址送到 Discord。
+
+## GitHub Secrets
+
+在 Repository → Settings → Secrets and variables → Actions 新增：
+
+- `BBO_USERNAME`：BBO 登入帳號
+- `BBO_PASSWORD`：BBO 登入密碼
+- `DISCORD_WEBHOOK_URL`：Discord 頻道 Webhook URL
+
+不要把這些值寫進程式碼或 `state.json`。
+
+## 時間分組規則
+
+程式預設以 30 分鐘分組。若最新一組牌局的最後一牌距離執行時間少於 30 分鐘，整組會標記為 pending，不會送 Discord，也不會更新成已完成。下一次執行時才會補送。
+
+## 手動執行
+
+安裝依賴後：
+
+```bash
+python -m pip install -r requirements-bbo-discord.txt
+python -m playwright install chromium
+python bbo_discord_sync.py --dry-run
+```
+
+本機沒有設定 BBO 帳密時，可以使用可見瀏覽器手動登入：
+
+```bash
+python bbo_discord_sync.py --manual-login --dry-run
+```
+
+GitHub Actions 使用 `workflow_dispatch` 可手動觸發，也會每天 00:00 UTC 自動執行。`state.json` 會由 Actions commit 回 Repository，保存上次已處理時間與已送出的網址。
