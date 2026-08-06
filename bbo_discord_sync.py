@@ -9,9 +9,10 @@ import html as html_lib
 import json
 import os
 import re
+import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as midnight
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -94,6 +95,35 @@ def links_on_page(page) -> list[tuple[str, str]]:
     return links
 
 
+def lin_links_on_page(page) -> list[tuple[str, str]]:
+    """Read the permanent LIN embedded in Movie's hv_popuplin onclick."""
+    links: list[tuple[str, str]] = []
+    pattern = re.compile(r"(?:(?:https?:)?//|/)[^\"'()<> ]*(?:handviewer\.html|hands\.php)\?[^\"'()<> ]*lin=[^\"'()<> ]+", re.I)
+    for anchor in page.locator("a").all():
+        text = row_text(anchor)
+        attrs = [anchor.get_attribute(name) or "" for name in ("href", "onclick", "data-href", "data-url")]
+        for raw in attrs:
+            popup = re.search(r"hv_popuplin\(\s*['\"](.*?)['\"]\s*\)", html_lib.unescape(raw), re.I)
+            if popup:
+                lin = popup.group(1).replace("\\'", "'").replace('\\"', '"')
+                row_hrefs = []
+                try:
+                    for row_anchor in anchor.locator("xpath=ancestor::tr[1]//a").all():
+                        row_hrefs.append(row_anchor.get_attribute("href") or "")
+                except Exception:
+                    pass
+                links.append(("https://www.bridgebase.com/tools/handviewer.html?bbo=y&lin=" + lin, text + " " + raw + " " + " ".join(row_hrefs)))
+                continue
+            matches = pattern.findall(html_lib.unescape(raw).replace("\\/", "/"))
+            if not matches and "lin=" in raw:
+                matches = [raw]
+            for match in matches:
+                value = canonical(urljoin(page.url, match))
+                if value and "lin=" in value:
+                    links.append((value, text))
+    return links
+
+
 def extract_lin_url(page, fallback: str) -> str | None:
     candidates = [page.url]
     candidates += [url for url, _ in links_on_page(page)]
@@ -103,6 +133,12 @@ def extract_lin_url(page, fallback: str) -> str | None:
         value = canonical(candidate)
         if value and "lin=" in value:
             return value
+    # Some versions keep the expanded LIN only as a JavaScript/string value,
+    # without the handviewer URL around it.
+    for match in re.finditer(r"(?:[?&]lin=|['\"]lin['\"]\s*[:=]\s*['\"])([^'\"<>]+)", source, re.I):
+        value = match.group(1).replace("\\u0026", "&").replace("\\u003d", "=")
+        if "pn" in unquote(value).lower() and "md" in unquote(value).lower():
+            return "https://www.bridgebase.com/tools/handviewer.html?bbo=y&lin=" + value
     return canonical(fallback) if "lin=" in fallback else None
 
 
@@ -110,6 +146,14 @@ def players_from_lin(url: str) -> set[str]:
     raw = parse_qs(urlparse(url).query).get("lin", [""])[0]
     match = re.search(r"(?:^|\|)pn\|([^|]*)", unquote(raw), re.I)
     return {x.strip().lower() for x in match.group(1).split(",")} if match else set()
+
+
+def rendered_players(page) -> set[str]:
+    return {
+        text.strip().lower()
+        for text in page.locator(".nameTextDivStyle").all_inner_texts()
+        if text.strip()
+    }
 
 
 def board_label(url: str, index: int) -> str:
@@ -121,48 +165,66 @@ def board_label(url: str, index: int) -> str:
 def collect_hands(page, target: str, zone: str, screenshot_dir: Path) -> list[Hand]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-    candidates: dict[str, str] = {}
-    for url, text in links_on_page(page):
-        candidates[url] = text
-    travellers: dict[str, str] = {}
-    for anchor in page.locator("a").all():
-        href = anchor.get_attribute("href") or ""
-        if "traveller=" in href:
-            travellers[urljoin(page.url, href)] = row_text(anchor)
-    for traveller, text in travellers.items():
-        try:
-            page.goto(traveller, wait_until="domcontentloaded", timeout=45_000)
-            for url, link_text in links_on_page(page):
-                candidates[url] = link_text or text
-        except PlaywrightTimeoutError:
-            print(f"traveller timeout: {traveller}", file=sys.stderr)
-
-    print(f"BBO traveller {len(travellers)} 筆；候選 handviewer {len(candidates)} 筆")
+    # Important: this page is the single result page returned by the one BBO
+    # form submission. Do not open traveller/myhand pages to search again.
+    candidates: dict[str, str] = {
+        url: text for url, text in lin_links_on_page(page)
+    }
+    print(f"第一次查詢結果頁找到 Lin {len(candidates)} 筆")
 
     result: list[Hand] = []
     seen: set[str] = set()
     for index, (candidate, text) in enumerate(candidates.items(), 1):
+        # LIN already contains all four player names; discard other tables
+        # before opening the URL for the screenshot.
+        if "lin=" in candidate and target.lower() not in players_from_lin(candidate):
+            continue
         try:
             page.goto(candidate, wait_until="networkidle", timeout=45_000)
             page.wait_for_timeout(300)
         except PlaywrightTimeoutError:
             print(f"hand timeout: {candidate}", file=sys.stderr)
             continue
+        except Exception as exc:
+            print(f"hand load failed: {candidate} ({exc})", file=sys.stderr)
+            continue
         lin_url = extract_lin_url(page, candidate)
+        # The result page's Lin URL is authoritative. Never replace it with
+        # a myhand URL or try another search page.
+        lin_url = candidate if "lin=" in candidate else lin_url
         if not lin_url or lin_url in seen:
             continue
         seen.add(lin_url)
-        if target.lower() not in players_from_lin(lin_url):
-            continue
-        timestamp = timestamp_from_url(candidate) or timestamp_from_url(lin_url) or timestamp_from_text(text, zone)
+        timestamp = timestamp_from_url(candidate) or timestamp_from_url(text) or timestamp_from_url(lin_url) or timestamp_from_text(text, zone)
         if timestamp is None:
             continue
-        filename = f"{timestamp}-{hashlib.sha1(lin_url.encode()).hexdigest()[:10]}.png"
-        screenshot = screenshot_dir / filename
+        local_dt = datetime.fromtimestamp(timestamp, ZoneInfo(zone))
+        day_dir = screenshot_dir / local_dt.strftime("%Y-%m-%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{local_dt.strftime('%H%M%S')}-{board_label(lin_url, index).lower().replace(' ', '-')}-{hashlib.sha1(lin_url.encode()).hexdigest()[:8]}.png"
+        screenshot = day_dir / filename
         page.screenshot(path=str(screenshot), full_page=True)
         result.append(Hand(timestamp, lin_url, board_label(lin_url, index), str(screenshot)))
     print(f"展開 LIN 成功 {len(seen)} 筆；包含 {target} 的牌局 {len(result)} 筆")
     return sorted(result, key=lambda h: (h.timestamp, h.url))
+
+
+def organize_batch(batch: list[Hand], screenshot_dir: Path, zone: str) -> list[Hand]:
+    """Move screenshots into a date/session folder and return updated paths."""
+    if not batch:
+        return batch
+    first = datetime.fromtimestamp(batch[0].timestamp, ZoneInfo(zone))
+    session_dir = screenshot_dir / first.strftime("%Y-%m-%d") / f"session-{first.strftime('%H%M')}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    organized: list[Hand] = []
+    for number, hand in enumerate(batch, 1):
+        old_path = Path(hand.screenshot)
+        board = hand.label.lower().replace(" ", "-")
+        new_path = session_dir / f"{number:02d}-{board}-{first.strftime('%H%M')}.png"
+        if old_path.exists() and old_path.resolve() != new_path.resolve():
+            shutil.move(str(old_path), str(new_path))
+        organized.append(replace(hand, screenshot=str(new_path)))
+    return organized
 
 
 def groups(hands: list[Hand], gap: int) -> list[list[Hand]]:
@@ -273,6 +335,9 @@ def main() -> int:
             browser.close()
 
     stable, pending = stable_groups(hands, now, cfg.group_minutes * 60)
+    stable = [organize_batch(batch, screenshot_dir, cfg.timezone) for batch in stable]
+    if pending:
+        pending = organize_batch(pending, screenshot_dir, cfg.timezone)
     print(f"查到 {len(hands)} 筆；穩定 {sum(map(len, stable))} 筆；待下次 {len(pending)} 筆")
     sent = set(state.get("sent_urls", []))
     thread_ids = state.setdefault("threads", {})
