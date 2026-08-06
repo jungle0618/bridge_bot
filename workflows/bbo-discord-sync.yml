@@ -1,0 +1,41 @@
+name: BBO hands to Discord
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r bridge_bot/requirements-bbo-discord.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Sync BBO hands
+        env:
+          # These are intentionally public per project owner request.
+          BBO_USERNAME: "356567"
+          BBO_PASSWORD: "123456"
+          BBO_TARGET_USER: wei1011
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python bridge_bot/bbo_discord_sync.py
+
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bridge_bot/state.json
+          git diff --cached --quiet || git commit -m "chore: update BBO sync state"
+          git push
