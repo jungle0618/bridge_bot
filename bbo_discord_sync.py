@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
-"""Sync stable BBO hand records to a Discord webhook.
-
-Credentials are read from environment variables. The last stable timestamp
-and already sent URLs are stored in state.json so Actions can run repeatedly.
-"""
+"""Collect Wei1011's BBO hands and publish grouped LIN links to Discord."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import html as html_lib
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import date, datetime, time as midnight
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 
-
-MYHANDS_URL = "https://www.bridgebase.com/myhands/hands.php"
-LOGIN_URL = "https://www.bridgebase.com/myhands/index.php?&from_login=1"
+MYHANDS_URL = "https://www.bridgebase.com/myhands/index.php?&from_login=1"
 DEFAULT_TARGET = "wei1011"
-DEFAULT_TIMEZONE = "Asia/Taipei"
-DEFAULT_GAP = 30 * 60
+DEFAULT_ZONE = "Asia/Taipei"
 
 
 @dataclass(frozen=True)
@@ -34,247 +29,209 @@ class Hand:
     timestamp: int
     url: str
     label: str = ""
+    screenshot: str = ""
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Sync BBO hands to Discord")
+def parse_args():
+    p = argparse.ArgumentParser()
     p.add_argument("--target-user", default=os.getenv("BBO_TARGET_USER", DEFAULT_TARGET))
     p.add_argument("--state", type=Path, default=Path("state.json"))
-    p.add_argument("--timezone", default=os.getenv("BBO_TIMEZONE", DEFAULT_TIMEZONE))
-    p.add_argument("--lookback-hours", type=float, default=20 * 24, help="首次執行查詢的回溯時間，預設 20 天")
+    p.add_argument("--timezone", default=os.getenv("BBO_TIMEZONE", DEFAULT_ZONE))
+    p.add_argument("--days", type=int, default=20)
     p.add_argument("--group-minutes", type=int, default=30)
-    p.add_argument("--manual-login", action="store_true", help="Use visible browser and login manually")
-    p.add_argument("--dry-run", action="store_true", help="Do not send Discord messages or write state")
+    p.add_argument("--manual-login", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
 
-def date_timestamp(value: str, timezone: str) -> int:
-    zone = ZoneInfo(timezone)
-    return int(datetime.combine(date.fromisoformat(value), midnight.min, tzinfo=zone).timestamp())
-
-
-def make_query(target: str, start: int, end: int) -> str:
-    return MYHANDS_URL + "?" + urlencode({"username": target, "start_time": start, "end_time": end})
-
-
-def canonical_hand_url(url: str) -> str | None:
-    parsed = urlparse(url)
-    if "lin=" not in parsed.query and "myhand=" not in parsed.query:
+def canonical(url: str) -> str | None:
+    p = urlparse(html_lib.unescape(url).replace("\\/", "/"))
+    if "lin=" not in p.query and "myhand=" not in p.query:
         return None
-    if "lin=" in parsed.query:
-        query = parsed.query
-        if "bbo=" not in query:
-            query = "bbo=y&" + query
-        return "https://www.bridgebase.com/tools/handviewer.html?" + query
+    if "lin=" in p.query:
+        q = p.query if "bbo=" in p.query else "bbo=y&" + p.query
+        return "https://www.bridgebase.com/tools/handviewer.html?" + q
     return url
 
 
-def timestamp_from_text(text: str, timezone: str = DEFAULT_TIMEZONE) -> int | None:
+def timestamp_from_url(url: str) -> int | None:
+    values = [int(x) for x in re.findall(r"(?<!\d)(1[5-9]\d{8}|2\d{9})(?!\d)", url)]
+    return min(values) if values else None
+
+
+def timestamp_from_text(text: str, zone: str) -> int | None:
     patterns = [
         r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})[ T]+(\d{1,2}):(\d{2})",
         r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})[ T]+(\d{1,2}):(\d{2})",
-        r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})[ ,]+(\d{1,2}):(\d{2})",
     ]
-    months = {name: number for number, name in enumerate(
-        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1
-    )}
-    for index, pattern in enumerate(patterns):
-        match = re.search(pattern, text, re.I)
-        if not match:
+    for i, pattern in enumerate(patterns):
+        m = re.search(pattern, text)
+        if not m:
             continue
-        values = match.groups()
-        if index == 0:
-            year, month, day, hour, minute = map(int, values)
-        elif index == 1:
-            month, day, year, hour, minute = map(int, values)
+        a = list(map(int, m.groups()))
+        if i == 0:
+            year, month, day, hour, minute = a
         else:
-            day, month_name, year, hour, minute = values
-            month, year, day, hour, minute = months[month_name[:3].lower()], int(year), int(day), int(hour), int(minute)
-        return int(datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(timezone)).timestamp())
+            month, day, year, hour, minute = a
+        return int(datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(zone)).timestamp())
     return None
 
 
-def timestamp_from_url(url: str) -> int | None:
-    # BBO's myhand/traveller identifiers commonly contain a Unix timestamp.
-    candidates = [int(value) for value in re.findall(r"(?<!\d)(1[5-9]\d{8}|2\d{9})(?!\d)", url)]
-    return min(candidates) if candidates else None
+def row_text(anchor) -> str:
+    try:
+        return " ".join(anchor.locator("xpath=ancestor::tr[1]").inner_text(timeout=2_000).split())
+    except Exception:
+        return " ".join((anchor.inner_text() or "").split())
 
 
-def extract_timestamp(url: str, row_text: str, timezone: str = DEFAULT_TIMEZONE) -> int | None:
-    return timestamp_from_url(url) or timestamp_from_text(row_text, timezone)
-
-
-def viewer_links_on_page(page) -> list[tuple[str, str]]:
-    """Return (viewer_url, nearby_text) links from the current BBO page."""
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-    links: list[tuple[str, str]] = []
+def links_on_page(page) -> list[tuple[str, str]]:
+    links = []
     for anchor in page.locator("a").all():
         href = anchor.get_attribute("href") or ""
-        if "handviewer.html" not in href and "lin=" not in href and "myhand=" not in href:
-            continue
-        url = canonical_hand_url(urljoin(page.url, href))
-        if not url:
-            continue
-        try:
-            row_text = anchor.locator("xpath=ancestor::tr[1]").inner_text(timeout=2_000)
-        except PlaywrightTimeoutError:
-            row_text = anchor.inner_text()
-        links.append((url, " ".join(row_text.split())))
+        url = canonical(urljoin(page.url, href))
+        if url:
+            links.append((url, row_text(anchor)))
     return links
 
 
-def fetch_hands(page, timezone: str = DEFAULT_TIMEZONE) -> list[Hand]:
+def extract_lin_url(page, fallback: str) -> str | None:
+    candidates = [page.url]
+    candidates += [url for url, _ in links_on_page(page)]
+    source = html_lib.unescape(page.content()).replace("\\/", "/")
+    candidates += re.findall(r"(?:https?://|/)[^\"'<> ]*handviewer\.html\?[^\"'<> ]*lin=[^\"'<> ]+", source)
+    for candidate in candidates:
+        value = canonical(candidate)
+        if value and "lin=" in value:
+            return value
+    return canonical(fallback) if "lin=" in fallback else None
+
+
+def players_from_lin(url: str) -> set[str]:
+    raw = parse_qs(urlparse(url).query).get("lin", [""])[0]
+    match = re.search(r"(?:^|\|)pn\|([^|]*)", unquote(raw), re.I)
+    return {x.strip().lower() for x in match.group(1).split(",")} if match else set()
+
+
+def board_label(url: str, index: int) -> str:
+    raw = unquote(parse_qs(urlparse(url).query).get("lin", [""])[0])
+    m = re.search(r"(?:^|\|)ah\|Board\s+([^|]+)", raw, re.I)
+    return f"Board {m.group(1).strip()}" if m else f"Hand {index}"
+
+
+def collect_hands(page, target: str, zone: str, screenshot_dir: Path) -> list[Hand]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-    page.wait_for_timeout(1_000)
-    found: dict[str, Hand] = {}
-    traveller_links: list[tuple[str, str]] = []
+    candidates: dict[str, str] = {}
+    for url, text in links_on_page(page):
+        candidates[url] = text
+    travellers: dict[str, str] = {}
     for anchor in page.locator("a").all():
         href = anchor.get_attribute("href") or ""
-        if "traveller=" not in href:
-            continue
+        if "traveller=" in href:
+            travellers[urljoin(page.url, href)] = row_text(anchor)
+    for traveller, text in travellers.items():
         try:
-            row_text = anchor.locator("xpath=ancestor::tr[1]").inner_text(timeout=2_000)
+            page.goto(traveller, wait_until="domcontentloaded", timeout=45_000)
+            for url, link_text in links_on_page(page):
+                candidates[url] = link_text or text
         except PlaywrightTimeoutError:
-            row_text = anchor.inner_text()
-        traveller_links.append((urljoin(page.url, href), " ".join(row_text.split())))
+            print(f"traveller timeout: {traveller}", file=sys.stderr)
 
-    for url, row_text in viewer_links_on_page(page):
-        timestamp = extract_timestamp(url, row_text, timezone)
-        if timestamp is not None:
-            found[url] = Hand(timestamp=timestamp, url=url, label=row_text)
-
-    # My Hands search results normally expose traveller URLs first. Each
-    # traveller page contains the Movie link that expands to a handviewer URL.
-    seen_travellers: set[str] = set()
-    for traveller_url, result_text in traveller_links:
-        if traveller_url in seen_travellers:
-            continue
-        seen_travellers.add(traveller_url)
+    result: list[Hand] = []
+    seen: set[str] = set()
+    for index, (candidate, text) in enumerate(candidates.items(), 1):
         try:
-            page.goto(traveller_url, wait_until="domcontentloaded", timeout=45_000)
+            page.goto(candidate, wait_until="networkidle", timeout=45_000)
             page.wait_for_timeout(300)
-            for viewer_url, movie_text in viewer_links_on_page(page):
-                timestamp = extract_timestamp(viewer_url, movie_text, timezone) or timestamp_from_url(traveller_url)
-                if timestamp is not None:
-                    found[viewer_url] = Hand(timestamp=timestamp, url=viewer_url, label=movie_text or result_text)
         except PlaywrightTimeoutError:
-            print(f"跳過逾時 traveller：{traveller_url}", file=sys.stderr)
-    return sorted(found.values(), key=lambda item: (item.timestamp, item.url))
+            print(f"hand timeout: {candidate}", file=sys.stderr)
+            continue
+        lin_url = extract_lin_url(page, candidate)
+        if not lin_url or lin_url in seen:
+            continue
+        seen.add(lin_url)
+        if target.lower() not in players_from_lin(lin_url):
+            continue
+        timestamp = timestamp_from_url(candidate) or timestamp_from_url(lin_url) or timestamp_from_text(text, zone)
+        if timestamp is None:
+            continue
+        filename = f"{timestamp}-{hashlib.sha1(lin_url.encode()).hexdigest()[:10]}.png"
+        screenshot = screenshot_dir / filename
+        page.screenshot(path=str(screenshot), full_page=True)
+        result.append(Hand(timestamp, lin_url, board_label(lin_url, index), str(screenshot)))
+    return sorted(result, key=lambda h: (h.timestamp, h.url))
 
 
-def group_stable_hands(hands: list[Hand], now: int, gap_seconds: int = DEFAULT_GAP) -> tuple[list[Hand], list[Hand]]:
-    """Return (stable, pending). The newest close-together group stays pending."""
-    if not hands:
-        return [], []
-    groups: list[list[Hand]] = [[hands[0]]]
-    for hand in hands[1:]:
-        if hand.timestamp - groups[-1][-1].timestamp <= gap_seconds:
-            groups[-1].append(hand)
+def groups(hands: list[Hand], gap: int) -> list[list[Hand]]:
+    output: list[list[Hand]] = []
+    for hand in hands:
+        if not output or hand.timestamp - output[-1][-1].timestamp > gap:
+            output.append([hand])
         else:
-            groups.append([hand])
-    if now - groups[-1][-1].timestamp < gap_seconds:
-        return [hand for group in groups[:-1] for hand in group], groups[-1]
-    return [hand for group in groups for hand in group], []
+            output[-1].append(hand)
+    return output
+
+
+def stable_groups(hands: list[Hand], now: int, gap: int) -> tuple[list[list[Hand]], list[Hand]]:
+    batches = groups(hands, gap)
+    if batches and now - batches[-1][-1].timestamp < gap:
+        return batches[:-1], batches[-1]
+    return batches, []
+
+
+def group_stable_hands(hands: list[Hand], now: int, gap_seconds: int = 30 * 60) -> tuple[list[Hand], list[Hand]]:
+    """Backward-compatible flat view used by the unit tests."""
+    batches, pending = stable_groups(hands, now, gap_seconds)
+    return [hand for batch in batches for hand in batch], pending
+
+
+def discord_request(method: str, url: str, token: str, **kwargs):
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bot {token}"
+    for _ in range(8):
+        response = requests.request(method, url, headers=headers, timeout=60, **kwargs)
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response
+        try:
+            delay = float(response.json().get("retry_after", 2))
+        except (ValueError, TypeError):
+            delay = 2
+        print(f"Discord 限流，等待 {delay + 0.5:.1f} 秒…", file=sys.stderr)
+        time.sleep(delay + 0.5)
+    raise RuntimeError("Discord 持續限流，已停止。")
+
+
+def create_thread(channel_id: str, token: str, name: str) -> str:
+    root = discord_request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages", token, json={"content": f"BBO 牌局批次：{name}"}).json()
+    thread = discord_request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages/{root['id']}/threads", token, json={"name": name}).json()
+    return thread["id"]
+
+
+def send_hand(thread_id: str, token: str, hand: Hand, zone: str) -> None:
+    when = datetime.fromtimestamp(hand.timestamp, ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M")
+    payload = {"content": f"{hand.label}｜{when}\n{hand.url}"}
+    with open(hand.screenshot, "rb") as image:
+        discord_request("POST", f"https://discord.com/api/v10/channels/{thread_id}/messages", token, files={"files[0]": (Path(hand.screenshot).name, image, "image/png")}, data={"payload_json": json.dumps(payload)})
 
 
 def read_state(path: Path) -> dict:
-    if not path.exists():
-        return {"last_stable_time": 0, "sent_urls": []}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_state(path: Path, state: dict) -> None:
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def send_discord(webhook: str, hands: list[Hand], timezone: str) -> list[Hand]:
-    if not hands:
-        return []
-    zone = ZoneInfo(timezone)
-    delivered: list[Hand] = []
-    for hand in hands:
-        when = datetime.fromtimestamp(hand.timestamp, zone).strftime("%Y-%m-%d %H:%M")
-        content = f"BBO 新牌局：{when} ({timezone})\n{hand.url}"
-        for attempt in range(6):
-            response = requests.post(webhook, json={"content": content}, timeout=30)
-            if response.status_code == 429:
-                try:
-                    retry_after = float(response.json().get("retry_after", 2))
-                except (ValueError, TypeError):
-                    retry_after = float(response.headers.get("Retry-After", 2))
-                wait_seconds = max(retry_after, 1.0) + 0.5
-                print(f"Discord 限流，等待 {wait_seconds:.1f} 秒後重試…", file=sys.stderr)
-                time.sleep(wait_seconds)
-                continue
-            if response.status_code == 404:
-                raise RuntimeError("Discord Webhook 不存在或已失效，請重新建立並更新 DISCORD_WEBHOOK_URL。")
-            response.raise_for_status()
-            delivered.append(hand)
-            time.sleep(0.5)
-            break
-        else:
-            raise RuntimeError("Discord 持續回傳 429，已停止發送；下次執行會繼續未完成的牌局。")
-    return delivered
-
-
-def login_and_open_myhands(page, username: str | None, password: str | None, manual: bool) -> None:
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-    if page.locator('input[type="password"]').count() == 0:
-        return
-    if manual:
-        input("請在瀏覽器手動登入 BBO，完成後按 Enter：")
-        return
-    user = page.locator('input[name="username"], input[name="user"], input[type="text"]').first
-    secret = page.locator('input[type="password"]').first
-    user.fill(username or "")
-    secret.fill(password or "")
-    page.locator('button[type="submit"], input[type="submit"]').first.click()
-    for _ in range(30):
-        page.wait_for_timeout(1_000)
-        if page.locator('input[type="password"]').count() == 0:
-            return
-    raise RuntimeError("BBO 登入未完成，仍停留在登入頁。")
-
-
-def search_by_bbo_form(page, target: str, timezone: str) -> None:
-    """Use the same date/interval form as BBO's My Hands page."""
-    today = datetime.now(ZoneInfo(timezone)).date()
-    form = page.locator("#myhands")
-    if form.count() == 0:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-        form = page.locator("#myhands")
-    if form.count() == 0:
-        raise RuntimeError("登入後找不到 BBO My Hands 日期表單。")
-    form.locator('input[name="username"]').fill(target)
-    form.locator('select[name="start_time[Y]"]').select_option(str(today.year))
-    form.locator('select[name="start_time[M]"]').select_option(str(today.month))
-    form.locator('select[name="start_time[d]"]').select_option(str(today.day))
-    # BBO's form only offers up to a few days, so use 3 weeks (21 days)
-    # and apply the exact 20-day cutoff after parsing the results.
-    form.locator('select[name="time_interval[0]"]').select_option("1")  # week(s)
-    form.locator('select[name="time_interval[1]"]').select_option("3")
-    form.locator('input[name="time_arrow"][value="-"]').check()
-    form.locator('select[name="summaries[0]"]').select_option("3")
-    form.locator('input[type="submit"]').first.click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(1_000)
+    return json.loads(path.read_text()) if path.exists() else {"last_stable_time": 0, "sent_urls": [], "threads": {}}
 
 
 def main() -> int:
     cfg = parse_args()
-    state = read_state(cfg.state)
     now = int(time.time())
-    start = state.get("last_stable_time") or now - int(cfg.lookback_hours * 3600)
-    webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    username = os.getenv("BBO_USERNAME")
-    password = os.getenv("BBO_PASSWORD")
+    state = read_state(cfg.state)
+    start = state.get("last_stable_time") or now - cfg.days * 86400
+    username, password = os.getenv("BBO_USERNAME"), os.getenv("BBO_PASSWORD")
+    token, channel_id = os.getenv("DISCORD_BOT_TOKEN"), os.getenv("DISCORD_CHANNEL_ID")
     if not cfg.manual_login and (not username or not password):
-        raise SystemExit("請設定 BBO_USERNAME、BBO_PASSWORD；本機測試可加 --manual-login")
-    if not webhook and not cfg.dry_run:
-        raise SystemExit("請設定 DISCORD_WEBHOOK_URL")
-
+        raise SystemExit("缺少 BBO_USERNAME 或 BBO_PASSWORD")
+    if not cfg.dry_run and (not token or not channel_id):
+        raise SystemExit("建立討論串需要 DISCORD_BOT_TOKEN 與 DISCORD_CHANNEL_ID")
+    screenshot_dir = Path("screenshots")
+    screenshot_dir.mkdir(exist_ok=True)
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
@@ -282,35 +239,59 @@ def main() -> int:
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, locale="zh-TW")
         page = context.new_page()
         try:
-            login_and_open_myhands(page, username, password, cfg.manual_login)
-            search_by_bbo_form(page, cfg.target_user, cfg.timezone)
-            hands = fetch_hands(page, cfg.timezone)
-            hands = [hand for hand in hands if hand.timestamp >= start]
+            page.goto(MYHANDS_URL, wait_until="domcontentloaded", timeout=60_000)
+            if page.locator('input[type="password"]').count():
+                if cfg.manual_login:
+                    input("請手動登入 BBO 後按 Enter：")
+                else:
+                    page.locator('input[name="username"], input[name="user"], input[type="text"]').first.fill(username)
+                    page.locator('input[type="password"]').first.fill(password)
+                    page.locator('button[type="submit"], input[type="submit"]').first.click()
+                    page.wait_for_timeout(2_000)
+            form = page.locator("#myhands")
+            if not form.count():
+                page.goto(MYHANDS_URL, wait_until="domcontentloaded", timeout=60_000)
+                form = page.locator("#myhands")
+            today = datetime.now(ZoneInfo(cfg.timezone)).date()
+            form.locator('input[name="username"]').fill(cfg.target_user)
+            form.locator('select[name="start_time[Y]"]').select_option(str(today.year))
+            form.locator('select[name="start_time[M]"]').select_option(str(today.month))
+            form.locator('select[name="start_time[d]"]').select_option(str(today.day))
+            form.locator('select[name="time_interval[0]"]').select_option("1")
+            form.locator('select[name="time_interval[1]"]').select_option("3")
+            form.locator('input[name="time_arrow"][value="-"]').check()
+            form.locator('select[name="summaries[0]"]').select_option("3")
+            form.locator('input[type="submit"]').first.click()
+            page.wait_for_load_state("domcontentloaded")
+            hands = [h for h in collect_hands(page, cfg.target_user, cfg.timezone, screenshot_dir) if h.timestamp >= start]
         finally:
             context.close()
             browser.close()
 
-    stable, pending = group_stable_hands(hands, now, cfg.group_minutes * 60)
+    stable, pending = stable_groups(hands, now, cfg.group_minutes * 60)
+    print(f"查到 {len(hands)} 筆；穩定 {sum(map(len, stable))} 筆；待下次 {len(pending)} 筆")
     sent = set(state.get("sent_urls", []))
-    new_hands = [hand for hand in stable if hand.url not in sent and hand.timestamp >= start]
-    print(f"查到 {len(hands)} 筆；穩定 {len(stable)} 筆；待下次 {len(pending)} 筆；新增 {len(new_hands)} 筆")
-    for hand in pending:
-        print(f"PENDING {hand.timestamp}: {hand.url}")
-    delivered: list[Hand] = []
-    if new_hands and not cfg.dry_run:
-        try:
-            delivered = send_discord(webhook, new_hands, cfg.timezone)
-        except Exception:
-            # Preserve successfully delivered URLs even when a later message
-            # fails, so a retry does not resend the whole batch.
-            state["sent_urls"] = list((sent | {hand.url for hand in delivered}))[-5000:]
-            write_state(cfg.state, state)
-            raise
+    thread_ids = state.setdefault("threads", {})
+    for batch in stable:
+        new = [h for h in batch if h.url not in sent]
+        if not new:
+            continue
+        key = str(batch[0].timestamp)
+        if not cfg.dry_run:
+            thread_id = thread_ids.get(key) or create_thread(channel_id, token, datetime.fromtimestamp(batch[0].timestamp, ZoneInfo(cfg.timezone)).strftime("%Y-%m-%d %H:%M"))
+            thread_ids[key] = thread_id
+            for hand in new:
+                send_hand(thread_id, token, hand, cfg.timezone)
+                sent.add(hand.url)
+                state["sent_urls"] = list(sent)[-5000:]
+                cfg.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        else:
+            sent.update(h.url for h in new)
     if not cfg.dry_run:
-        state["sent_urls"] = list((sent | {hand.url for hand in delivered}))[-5000:]
-        if stable and len(delivered) == len(new_hands):
-            state["last_stable_time"] = max(hand.timestamp for hand in stable)
-        write_state(cfg.state, state)
+        state["sent_urls"] = list(sent)[-5000:]
+        if stable and not pending:
+            state["last_stable_time"] = max(h.timestamp for batch in stable for h in batch)
+        cfg.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     return 0
 
 

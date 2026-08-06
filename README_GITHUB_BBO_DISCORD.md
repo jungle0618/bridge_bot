@@ -2,13 +2,16 @@
 
 這個專案每天執行一次，使用 BBO My Hands 原本的日期表單查詢 `wei1011` 的牌局，並把已經穩定的牌局網址送到 Discord。第一次執行會查最近 20 天。
 
-## GitHub Secret
+## GitHub Secrets
 
-只需要在 Repository → Settings → Secrets and variables → Actions 新增：
+在 Repository → Settings → Secrets and variables → Actions 新增：
 
-- `DISCORD_WEBHOOK_URL`：Discord 頻道 Webhook URL
+- `DISCORD_BOT_TOKEN`：Discord Bot Token
+- `DISCORD_CHANNEL_ID`：要建立討論串的文字頻道 ID
 
-BBO 帳號與密碼目前依專案設定直接寫在 `.github/workflows/bbo-discord-sync.yml`。Discord Webhook 仍必須保持 Secret。
+BBO 帳號與密碼目前依專案設定直接寫在 `.github/workflows/bbo-discord-sync.yml`。
+
+Bot 必須加入 Discord Server，並在目標頻道具有 `View Channel`、`Send Messages`、`Create Public Threads`、`Send Messages in Threads` 權限。
 
 ## 時間分組規則
 

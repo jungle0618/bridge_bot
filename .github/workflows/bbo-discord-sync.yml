@@ -29,7 +29,8 @@ jobs:
           BBO_USERNAME: "356567"
           BBO_PASSWORD: "123456"
           BBO_TARGET_USER: wei1011
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
         run: python bbo_discord_sync.py
 
       - name: Save state
