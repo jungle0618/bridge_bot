@@ -19,6 +19,9 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MYHANDS_URL = "https://www.bridgebase.com/myhands/index.php?&from_login=1"
 MYHANDS_RESULTS_URL = "https://www.bridgebase.com/myhands/hands.php"

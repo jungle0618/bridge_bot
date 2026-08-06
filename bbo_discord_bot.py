@@ -11,9 +11,11 @@ from types import SimpleNamespace
 
 import discord
 from discord import app_commands
+from dotenv import load_dotenv
 
 from bbo_discord_sync import date_range_timestamps, read_state, sync_range
 
+load_dotenv()
 
 class BBOBot(discord.Client):
     def __init__(self) -> None:
