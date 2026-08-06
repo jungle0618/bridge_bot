@@ -1,6 +1,6 @@
 # BBO → Discord GitHub Repository
 
-這個專案每天執行一次，使用 BBO My Hands 原本的日期表單查詢 `wei1011` 的牌局，並把已經穩定的牌局網址送到 Discord。第一次執行會查最近 31 天。
+這個專案每天執行一次，使用 BBO My Hands 原本的日期表單查詢 `wei1011` 的牌局，並把已經穩定的牌局網址送到 Discord。第一次執行會查最近 20 天。
 
 ## GitHub Secret
 

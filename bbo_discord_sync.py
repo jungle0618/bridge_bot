@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-user", default=os.getenv("BBO_TARGET_USER", DEFAULT_TARGET))
     p.add_argument("--state", type=Path, default=Path("state.json"))
     p.add_argument("--timezone", default=os.getenv("BBO_TIMEZONE", DEFAULT_TIMEZONE))
-    p.add_argument("--lookback-hours", type=float, default=31 * 24, help="首次執行查詢的回溯時間，預設 31 天")
+    p.add_argument("--lookback-hours", type=float, default=20 * 24, help="首次執行查詢的回溯時間，預設 20 天")
     p.add_argument("--group-minutes", type=int, default=30)
     p.add_argument("--manual-login", action="store_true", help="Use visible browser and login manually")
     p.add_argument("--dry-run", action="store_true", help="Do not send Discord messages or write state")
@@ -189,16 +189,34 @@ def write_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def send_discord(webhook: str, hands: list[Hand], timezone: str) -> None:
+def send_discord(webhook: str, hands: list[Hand], timezone: str) -> list[Hand]:
     if not hands:
-        return
+        return []
     zone = ZoneInfo(timezone)
+    delivered: list[Hand] = []
     for hand in hands:
         when = datetime.fromtimestamp(hand.timestamp, zone).strftime("%Y-%m-%d %H:%M")
         content = f"BBO 新牌局：{when} ({timezone})\n{hand.url}"
-        response = requests.post(webhook, json={"content": content}, timeout=30)
-        response.raise_for_status()
-        time.sleep(1.0)
+        for attempt in range(6):
+            response = requests.post(webhook, json={"content": content}, timeout=30)
+            if response.status_code == 429:
+                try:
+                    retry_after = float(response.json().get("retry_after", 2))
+                except (ValueError, TypeError):
+                    retry_after = float(response.headers.get("Retry-After", 2))
+                wait_seconds = max(retry_after, 1.0) + 0.5
+                print(f"Discord 限流，等待 {wait_seconds:.1f} 秒後重試…", file=sys.stderr)
+                time.sleep(wait_seconds)
+                continue
+            if response.status_code == 404:
+                raise RuntimeError("Discord Webhook 不存在或已失效，請重新建立並更新 DISCORD_WEBHOOK_URL。")
+            response.raise_for_status()
+            delivered.append(hand)
+            time.sleep(0.5)
+            break
+        else:
+            raise RuntimeError("Discord 持續回傳 429，已停止發送；下次執行會繼續未完成的牌局。")
+    return delivered
 
 
 def login_and_open_myhands(page, username: str | None, password: str | None, manual: bool) -> None:
@@ -233,8 +251,10 @@ def search_by_bbo_form(page, target: str, timezone: str) -> None:
     form.locator('select[name="start_time[Y]"]').select_option(str(today.year))
     form.locator('select[name="start_time[M]"]').select_option(str(today.month))
     form.locator('select[name="start_time[d]"]').select_option(str(today.day))
-    form.locator('select[name="time_interval[0]"]').select_option("2")  # month(s)
-    form.locator('select[name="time_interval[1]"]').select_option("1")
+    # BBO's form only offers up to a few days, so use 3 weeks (21 days)
+    # and apply the exact 20-day cutoff after parsing the results.
+    form.locator('select[name="time_interval[0]"]').select_option("1")  # week(s)
+    form.locator('select[name="time_interval[1]"]').select_option("3")
     form.locator('input[name="time_arrow"][value="-"]').check()
     form.locator('select[name="summaries[0]"]').select_option("3")
     form.locator('input[type="submit"]').first.click()
@@ -265,6 +285,7 @@ def main() -> int:
             login_and_open_myhands(page, username, password, cfg.manual_login)
             search_by_bbo_form(page, cfg.target_user, cfg.timezone)
             hands = fetch_hands(page, cfg.timezone)
+            hands = [hand for hand in hands if hand.timestamp >= start]
         finally:
             context.close()
             browser.close()
@@ -275,11 +296,19 @@ def main() -> int:
     print(f"查到 {len(hands)} 筆；穩定 {len(stable)} 筆；待下次 {len(pending)} 筆；新增 {len(new_hands)} 筆")
     for hand in pending:
         print(f"PENDING {hand.timestamp}: {hand.url}")
+    delivered: list[Hand] = []
     if new_hands and not cfg.dry_run:
-        send_discord(webhook, new_hands, cfg.timezone)
+        try:
+            delivered = send_discord(webhook, new_hands, cfg.timezone)
+        except Exception:
+            # Preserve successfully delivered URLs even when a later message
+            # fails, so a retry does not resend the whole batch.
+            state["sent_urls"] = list((sent | {hand.url for hand in delivered}))[-5000:]
+            write_state(cfg.state, state)
+            raise
     if not cfg.dry_run:
-        state["sent_urls"] = list((sent | {hand.url for hand in new_hands}))[-5000:]
-        if stable:
+        state["sent_urls"] = list((sent | {hand.url for hand in delivered}))[-5000:]
+        if stable and len(delivered) == len(new_hands):
             state["last_stable_time"] = max(hand.timestamp for hand in stable)
         write_state(cfg.state, state)
     return 0
