@@ -11,13 +11,19 @@
 
 BBO 帳號與密碼目前依專案設定直接寫在 `.github/workflows/bbo-discord-sync.yml`。
 
-Bot 必須加入 Discord Server，並在目標頻道具有 `View Channel`、`Send Messages`、`Create Public Threads`、`Send Messages in Threads` 權限。
+Bot 必須加入 Discord Server，並在參考頻道具有：
+
+- `View Channel`
+- `Manage Channels`（建立每組牌的新頻道）
+- `Send Messages`
+- `Create Public Threads`
+- `Send Messages in Threads`
 
 若要重新掃描最近 20 天，刪除 Repository 根目錄的 `state.json` 後重新執行一次 Workflow。正常排程不應刪除它，因為它用來避免重複發送。
 
 ## 時間分組規則
 
-程式預設以 30 分鐘分組。若最新一組牌局的最後一牌距離執行時間少於 30 分鐘，整組會標記為 pending，不會送 Discord，也不會更新成已完成。下一次執行時才會補送。
+程式預設以 30 分鐘分組。每一組會建立一個新 Discord 頻道；每一副牌會在該頻道建立一個討論串，並按照牌號由小到大發送。若最新一組牌局的最後一牌距離執行時間少於 30 分鐘，整組會標記為 pending，不會送 Discord，也不會更新成已完成。
 
 ## 手動執行
 

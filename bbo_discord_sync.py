@@ -213,7 +213,7 @@ def organize_batch(batch: list[Hand], screenshot_dir: Path, zone: str) -> list[H
     """Move screenshots into a date/session folder and return updated paths."""
     if not batch:
         return batch
-    first = datetime.fromtimestamp(batch[0].timestamp, ZoneInfo(zone))
+    first = datetime.fromtimestamp(min(hand.timestamp for hand in batch), ZoneInfo(zone))
     session_dir = screenshot_dir / first.strftime("%Y-%m-%d") / f"session-{first.strftime('%H%M')}"
     session_dir.mkdir(parents=True, exist_ok=True)
     organized: list[Hand] = []
@@ -225,6 +225,15 @@ def organize_batch(batch: list[Hand], screenshot_dir: Path, zone: str) -> list[H
             shutil.move(str(old_path), str(new_path))
         organized.append(replace(hand, screenshot=str(new_path)))
     return organized
+
+
+def board_number(hand: Hand) -> int:
+    match = re.search(r"board\s+(\d+)", hand.label, re.I)
+    return int(match.group(1)) if match else 10**9
+
+
+def ordered_batch(batch: list[Hand]) -> list[Hand]:
+    return sorted(batch, key=lambda hand: (board_number(hand), hand.timestamp, hand.url))
 
 
 def groups(hands: list[Hand], gap: int) -> list[list[Hand]]:
@@ -267,17 +276,34 @@ def discord_request(method: str, url: str, token: str, **kwargs):
     raise RuntimeError("Discord 持續限流，已停止。")
 
 
-def create_thread(channel_id: str, token: str, name: str) -> str:
-    root = discord_request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages", token, json={"content": f"BBO 牌局批次：{name}"}).json()
+def create_group_channel(parent_channel_id: str, token: str, name: str) -> str:
+    parent = discord_request("GET", f"https://discord.com/api/v10/channels/{parent_channel_id}", token).json()
+    safe_name = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:90]
+    payload = {"name": f"bbo-{safe_name}", "type": 0}
+    if parent.get("parent_id"):
+        payload["parent_id"] = parent["parent_id"]
+    channel = discord_request("POST", f"https://discord.com/api/v10/guilds/{parent['guild_id']}/channels", token, json=payload).json()
+    return channel["id"]
+
+
+def create_hand_thread(channel_id: str, token: str, hand: Hand, zone: str) -> str:
+    root = discord_request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages", token, json={"content": f"{hand.label}"}).json()
+    name = re.sub(r"[^a-z0-9-]", "-", hand.label.lower()).strip("-")[:90] or "hand"
     thread = discord_request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages/{root['id']}/threads", token, json={"name": name}).json()
     return thread["id"]
 
 
 def send_hand(thread_id: str, token: str, hand: Hand, zone: str) -> None:
     when = datetime.fromtimestamp(hand.timestamp, ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M")
-    payload = {"content": f"{hand.label}｜{when}\n{hand.url}"}
+    filename = Path(hand.screenshot).name
+    payload = {"embeds": [{
+        "title": f"{hand.label}｜{when}",
+        "url": hand.url,
+        "description": "開啟 BBO LIN 牌局",
+        "image": {"url": f"attachment://{filename}"},
+    }]}
     with open(hand.screenshot, "rb") as image:
-        discord_request("POST", f"https://discord.com/api/v10/channels/{thread_id}/messages", token, files={"files[0]": (Path(hand.screenshot).name, image, "image/png")}, data={"payload_json": json.dumps(payload)})
+        discord_request("POST", f"https://discord.com/api/v10/channels/{thread_id}/messages", token, files={"files[0]": (filename, image, "image/png")}, data={"payload_json": json.dumps(payload, ensure_ascii=False)})
 
 
 def read_state(path: Path) -> dict:
@@ -335,21 +361,25 @@ def main() -> int:
             browser.close()
 
     stable, pending = stable_groups(hands, now, cfg.group_minutes * 60)
-    stable = [organize_batch(batch, screenshot_dir, cfg.timezone) for batch in stable]
+    stable = [organize_batch(ordered_batch(batch), screenshot_dir, cfg.timezone) for batch in stable]
     if pending:
-        pending = organize_batch(pending, screenshot_dir, cfg.timezone)
+        pending = organize_batch(ordered_batch(pending), screenshot_dir, cfg.timezone)
     print(f"查到 {len(hands)} 筆；穩定 {sum(map(len, stable))} 筆；待下次 {len(pending)} 筆")
     sent = set(state.get("sent_urls", []))
-    thread_ids = state.setdefault("threads", {})
+    group_channels = state.setdefault("group_channels", {})
+    hand_threads = state.setdefault("hand_threads", {})
     for batch in stable:
         new = [h for h in batch if h.url not in sent]
         if not new:
             continue
-        key = str(batch[0].timestamp)
+        key = str(min(hand.timestamp for hand in batch))
         if not cfg.dry_run:
-            thread_id = thread_ids.get(key) or create_thread(channel_id, token, datetime.fromtimestamp(batch[0].timestamp, ZoneInfo(cfg.timezone)).strftime("%Y-%m-%d %H:%M"))
-            thread_ids[key] = thread_id
+            group_time = datetime.fromtimestamp(int(key), ZoneInfo(cfg.timezone)).strftime("%Y-%m-%d-%H%M")
+            group_channel = group_channels.get(key) or create_group_channel(channel_id, token, group_time)
+            group_channels[key] = group_channel
             for hand in new:
+                thread_id = hand_threads.get(hand.url) or create_hand_thread(group_channel, token, hand, cfg.timezone)
+                hand_threads[hand.url] = thread_id
                 send_hand(thread_id, token, hand, cfg.timezone)
                 sent.add(hand.url)
                 state["sent_urls"] = list(sent)[-5000:]
